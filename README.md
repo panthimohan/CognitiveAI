@@ -2,6 +2,8 @@
 
 A modular cognitive intelligence platform.
 
+AI-powered cognitive architecture designed for modular intelligence, learning, memory, and privacy management.
+
 ## Core Architecture
 
 - Metacognitive Supervisor

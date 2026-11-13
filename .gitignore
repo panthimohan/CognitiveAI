@@ -6,3 +6,4 @@ __pycache__/
 venv/
 cognitiveai/
 .DS_Store
+data/personal/

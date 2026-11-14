@@ -14,7 +14,7 @@ def test_home_endpoint():
     assert response.json() == {
         "application": "CognitiveAI",
         "status": "running",
-        "version": "0.3.0"
+        "version": "0.4.1"
     }
 
 

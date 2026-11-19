@@ -2,7 +2,7 @@
 """
 CognitiveAI - Persistent Conversation Archive
 
-Stores the original user messages and AI responses in SQLite.
+Stores original user messages and AI responses in SQLite.
 The archive is independent of the memory extraction system.
 
 A saved message remains available even if background learning fails.
@@ -44,11 +44,7 @@ class ConversationArchive:
             )
 
         self.database_path = Path(database_path)
-        self.database_path.parent.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize_database()
 
     def _connect(self) -> sqlite3.Connection:
@@ -78,7 +74,6 @@ class ConversationArchive:
                     privacy TEXT NOT NULL
                         CHECK(privacy IN ('private', 'public')),
                     created_at TEXT NOT NULL,
-
                     UNIQUE(owner, interaction_id, role)
                 )
                 """
@@ -86,25 +81,17 @@ class ConversationArchive:
 
             connection.execute(
                 """
-                CREATE INDEX IF NOT EXISTS
-                idx_conversation_history
+                CREATE INDEX IF NOT EXISTS idx_conversation_history
                 ON conversation_messages (
-                    owner,
-                    conversation_id,
-                    created_at
+                    owner, conversation_id, created_at
                 )
                 """
             )
 
             connection.execute(
                 """
-                CREATE INDEX IF NOT EXISTS
-                idx_conversation_privacy
-                ON conversation_messages (
-                    owner,
-                    privacy,
-                    created_at
-                )
+                CREATE INDEX IF NOT EXISTS idx_conversation_privacy
+                ON conversation_messages (owner, privacy, created_at)
                 """
             )
 
@@ -118,28 +105,18 @@ class ConversationArchive:
         content: str,
         privacy: PrivacyScope = "private",
     ) -> ConversationMessage:
-        """
-        Save one conversation message.
-
-        Saving the same interaction and role twice is idempotent:
-        the existing record is returned instead of duplicated.
-        """
+        """Save one message. Duplicate interaction/role pairs are ignored."""
 
         if not owner.strip():
             raise ValueError("Owner cannot be empty.")
-
         if not conversation_id.strip():
             raise ValueError("Conversation ID cannot be empty.")
-
         if not interaction_id.strip():
             raise ValueError("Interaction ID cannot be empty.")
-
         if role not in {"user", "assistant"}:
             raise ValueError("Role must be user or assistant.")
-
         if privacy not in {"private", "public"}:
             raise ValueError("Privacy must be private or public.")
-
         if not isinstance(content, str) or not content.strip():
             raise ValueError("Message content cannot be empty.")
 
@@ -150,14 +127,8 @@ class ConversationArchive:
             connection.execute(
                 """
                 INSERT OR IGNORE INTO conversation_messages (
-                    id,
-                    owner,
-                    conversation_id,
-                    interaction_id,
-                    role,
-                    content,
-                    privacy,
-                    created_at
+                    id, owner, conversation_id, interaction_id,
+                    role, content, privacy, created_at
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
@@ -177,9 +148,7 @@ class ConversationArchive:
                 """
                 SELECT *
                 FROM conversation_messages
-                WHERE owner = ?
-                  AND interaction_id = ?
-                  AND role = ?
+                WHERE owner = ? AND interaction_id = ? AND role = ?
                 """,
                 (owner, interaction_id, role),
             ).fetchone()
@@ -194,25 +163,21 @@ class ConversationArchive:
         limit: int = 1000,
         privacy: PrivacyScope | None = None,
     ) -> list[ConversationMessage]:
-        """Return conversation messages chronologically, optionally privacy-filtered."""
+        """Return messages chronologically, optionally filtered by privacy."""
 
         if not owner.strip():
             raise ValueError("Owner cannot be empty.")
-
         if not conversation_id.strip():
             raise ValueError("Conversation ID cannot be empty.")
-
         if limit < 1 or limit > 10000:
             raise ValueError("Limit must be between 1 and 10000.")
-
         if privacy is not None and privacy not in {"private", "public"}:
             raise ValueError("Invalid privacy scope.")
 
         query = """
             SELECT *
             FROM conversation_messages
-            WHERE owner = ?
-              AND conversation_id = ?
+            WHERE owner = ? AND conversation_id = ?
         """
         parameters: list = [owner, conversation_id]
 
@@ -224,12 +189,97 @@ class ConversationArchive:
         parameters.append(limit)
 
         with self._connect() as connection:
-            rows = connection.execute(
-                query,
-                parameters,
-            ).fetchall()
+            rows = connection.execute(query, parameters).fetchall()
 
         return [self._to_message(row) for row in rows]
+
+    def get_conversation_page(
+        self,
+        *,
+        owner: str,
+        conversation_id: str,
+        offset: int = 0,
+        limit: int = 500,
+        privacy: PrivacyScope | None = None,
+    ) -> list[ConversationMessage]:
+        """
+        Return one chronological page of conversation history.
+
+        Append-only archive plus offset pagination allows background
+        learning to process conversations larger than 10,000 messages.
+        """
+
+        if not owner or not owner.strip():
+            raise ValueError("Owner cannot be empty.")
+        if not conversation_id or not conversation_id.strip():
+            raise ValueError("Conversation ID cannot be empty.")
+        if offset < 0:
+            raise ValueError("Offset cannot be negative.")
+        if limit < 1 or limit > 10000:
+            raise ValueError("Limit must be between 1 and 10000.")
+        if privacy is not None and privacy not in {"private", "public"}:
+            raise ValueError("Invalid privacy scope.")
+
+        query = """
+            SELECT *
+            FROM conversation_messages
+            WHERE owner = ? AND conversation_id = ?
+        """
+        parameters: list = [owner, conversation_id]
+
+        if privacy is not None:
+            query += " AND privacy = ?"
+            parameters.append(privacy)
+
+        query += """
+            ORDER BY created_at ASC, rowid ASC
+            LIMIT ? OFFSET ?
+        """
+        parameters.extend([limit, offset])
+
+        with self._connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+
+        return [self._to_message(row) for row in rows]
+
+    def list_conversations(
+        self,
+        *,
+        owner: str,
+        privacy: PrivacyScope | None = None,
+    ) -> list[dict]:
+        """Return one summary per conversation."""
+
+        if not owner.strip():
+            raise ValueError("Owner cannot be empty.")
+        if privacy is not None and privacy not in {"private", "public"}:
+            raise ValueError("Invalid privacy scope.")
+
+        query = """
+            SELECT
+                conversation_id,
+                privacy,
+                COUNT(*) AS message_count,
+                MIN(created_at) AS first_message_at,
+                MAX(created_at) AS last_message_at
+            FROM conversation_messages
+            WHERE owner = ?
+        """
+        parameters: list = [owner]
+
+        if privacy is not None:
+            query += " AND privacy = ?"
+            parameters.append(privacy)
+
+        query += """
+            GROUP BY conversation_id, privacy
+            ORDER BY last_message_at ASC
+        """
+
+        with self._connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+
+        return [dict(row) for row in rows]
 
     def list_messages(
         self,
@@ -243,10 +293,8 @@ class ConversationArchive:
 
         if limit < 1 or limit > 10000:
             raise ValueError("Limit must be between 1 and 10000.")
-
         if offset < 0:
             raise ValueError("Offset cannot be negative.")
-
         if privacy is not None and privacy not in {"private", "public"}:
             raise ValueError("Invalid privacy scope.")
 
@@ -268,10 +316,7 @@ class ConversationArchive:
         parameters.extend([limit, offset])
 
         with self._connect() as connection:
-            rows = connection.execute(
-                query,
-                parameters,
-            ).fetchall()
+            rows = connection.execute(query, parameters).fetchall()
 
         return [self._to_message(row) for row in rows]
 
@@ -293,15 +338,11 @@ class ConversationArchive:
         if privacy is not None:
             if privacy not in {"private", "public"}:
                 raise ValueError("Invalid privacy scope.")
-
             query += " AND privacy = ?"
             parameters.append(privacy)
 
         with self._connect() as connection:
-            result = connection.execute(
-                query,
-                parameters,
-            ).fetchone()
+            result = connection.execute(query, parameters).fetchone()
 
         return int(result[0])
 

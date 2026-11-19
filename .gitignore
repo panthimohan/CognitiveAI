@@ -22,3 +22,20 @@ dist/
 # IDE
 .vscode/
 .idea/
+
+# Private databases and backups
+data/*.sqlite3
+data/*.db
+*.zip
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python and frontend
+__pycache__/
+*.pyc
+.pytest_cache/
+node_modules/
+.venv/

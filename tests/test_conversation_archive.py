@@ -139,3 +139,101 @@ def test_different_owners_are_isolated(tmp_path):
 
     assert archive.count_messages(owner="user-a") == 1
     assert archive.count_messages(owner="user-b") == 0
+
+def test_conversation_pagination_returns_chronological_pages(tmp_path):
+    archive = ConversationArchive(
+        tmp_path / "conversations.sqlite3"
+    )
+
+    for number in range(7):
+        archive.save_message(
+            owner="test-user",
+            conversation_id="conversation-1",
+            interaction_id=f"interaction-{number}",
+            role="user",
+            content=f"Message {number}",
+        )
+
+    first_page = archive.get_conversation_page(
+        owner="test-user",
+        conversation_id="conversation-1",
+        offset=0,
+        limit=3,
+    )
+
+    second_page = archive.get_conversation_page(
+        owner="test-user",
+        conversation_id="conversation-1",
+        offset=3,
+        limit=3,
+    )
+
+    final_page = archive.get_conversation_page(
+        owner="test-user",
+        conversation_id="conversation-1",
+        offset=6,
+        limit=3,
+    )
+
+    assert [m.content for m in first_page] == [
+        "Message 0", "Message 1", "Message 2"
+    ]
+    assert [m.content for m in second_page] == [
+        "Message 3", "Message 4", "Message 5"
+    ]
+    assert [m.content for m in final_page] == ["Message 6"]
+
+
+def test_conversation_pagination_respects_privacy(tmp_path):
+    archive = ConversationArchive(
+        tmp_path / "conversations.sqlite3"
+    )
+
+    archive.save_message(
+        owner="test-user",
+        conversation_id="conversation-1",
+        interaction_id="interaction-1",
+        role="user",
+        content="Private message.",
+        privacy="private",
+    )
+
+    archive.save_message(
+        owner="test-user",
+        conversation_id="conversation-2",
+        interaction_id="interaction-2",
+        role="user",
+        content="Public message.",
+        privacy="public",
+    )
+
+    messages = archive.get_conversation_page(
+        owner="test-user",
+        conversation_id="conversation-2",
+        privacy="public",
+    )
+
+    assert len(messages) == 1
+    assert messages[0].content == "Public message."
+
+
+def test_conversation_pagination_validates_arguments(tmp_path):
+    archive = ConversationArchive(
+        tmp_path / "conversations.sqlite3"
+    )
+
+    import pytest
+
+    with pytest.raises(ValueError):
+        archive.get_conversation_page(
+            owner="test-user",
+            conversation_id="conversation-1",
+            offset=-1,
+        )
+
+    with pytest.raises(ValueError):
+        archive.get_conversation_page(
+            owner="test-user",
+            conversation_id="conversation-1",
+            limit=0,
+        )

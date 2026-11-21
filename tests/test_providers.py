@@ -219,7 +219,7 @@ def test_default_local_model_per_task_type():
     settings = get_settings()
 
     assert settings.local_model_for("coding") == "qwen2.5-coder:7b"
-    assert settings.local_model_for("reasoning") == "deepseek-r1:7b"
+    assert settings.local_model_for("reasoning") == "qwen3:8b"
     assert settings.local_model_for("conversation") == "qwen3:8b"
     assert settings.local_model_for("research") == "qwen3:8b"
     assert settings.local_model_for("anything-else") == "qwen3:8b"

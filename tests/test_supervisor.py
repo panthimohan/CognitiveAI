@@ -95,6 +95,7 @@ def test_evaluator_accepts_good_scores():
     )
 
     assert result.passed is True
+    assert result.decision == "accept"
 
 
 def test_evaluator_rejects_low_scores():
@@ -107,3 +108,112 @@ def test_evaluator_rejects_low_scores():
     )
 
     assert result.passed is False
+    assert result.decision == "revise"
+
+
+def test_evaluator_checks_correctness():
+    evaluator = CognitiveEvaluator()
+
+    result = evaluator.evaluate(
+        completeness=0.95,
+        relevance=0.95,
+        confidence=0.95,
+        correctness=0.4,
+    )
+
+    assert result.decision == "revise"
+    assert any("Correctness" in issue for issue in result.issues)
+
+
+def test_evaluator_checks_instruction_adherence():
+    evaluator = CognitiveEvaluator()
+
+    result = evaluator.evaluate(
+        completeness=0.9,
+        relevance=0.9,
+        confidence=0.9,
+        instruction_adherence=0.4,
+    )
+
+    assert result.decision == "revise"
+
+
+def test_evaluator_detects_high_uncertainty():
+    evaluator = CognitiveEvaluator()
+
+    result = evaluator.evaluate(
+        completeness=0.9,
+        relevance=0.9,
+        confidence=0.9,
+        uncertainty=0.8,
+    )
+
+    assert result.decision == "revise"
+    assert result.passed is False
+
+
+def test_evaluator_detects_high_risk():
+    evaluator = CognitiveEvaluator()
+
+    result = evaluator.evaluate(
+        completeness=0.9,
+        relevance=0.9,
+        confidence=0.9,
+        risk=0.8,
+    )
+
+    assert result.decision == "revise"
+
+
+def test_evaluator_detects_unsupported_claims():
+    evaluator = CognitiveEvaluator()
+
+    result = evaluator.evaluate(
+        completeness=0.9,
+        relevance=0.9,
+        confidence=0.9,
+        unsupported_claims=True,
+    )
+
+    assert result.decision == "revise"
+
+
+def test_evaluator_requests_clarification():
+    evaluator = CognitiveEvaluator()
+
+    result = evaluator.evaluate(
+        completeness=0.9,
+        relevance=0.9,
+        confidence=0.9,
+        missing_information=True,
+    )
+
+    assert result.decision == "clarify"
+    assert result.passed is False
+
+
+def test_evaluator_rejects_invalid_scores():
+    evaluator = CognitiveEvaluator()
+
+    with pytest.raises(ValueError):
+        evaluator.evaluate(
+            completeness=1.5,
+            relevance=0.9,
+            confidence=0.9,
+        )
+
+
+def test_evaluator_calculates_overall_score():
+    evaluator = CognitiveEvaluator()
+
+    result = evaluator.evaluate(
+        completeness=1.0,
+        relevance=1.0,
+        confidence=1.0,
+        correctness=1.0,
+        instruction_adherence=1.0,
+        uncertainty=0.0,
+        risk=0.0,
+    )
+
+    assert result.overall_score == 1.0

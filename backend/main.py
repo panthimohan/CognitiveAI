@@ -5,8 +5,6 @@ import os
 from contextlib import asynccontextmanager
 from uuid import uuid4
 
-from backend.learning.contracts import LearningDomain
-
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -14,6 +12,9 @@ from pydantic import BaseModel, Field
 from backend.supervisor.router import TaskRequest, route_task
 from backend.supervisor.planner import CognitivePlanner
 from backend.supervisor.evaluator import CognitiveEvaluator
+from backend.supervisor.semantic_evaluator import (
+    SemanticEvaluator,
+)
 
 from backend.models.factory import create_provider
 from backend.models.providers import ModelRequest
@@ -23,6 +24,7 @@ from backend.memory.processor import MemoryProcessor
 from backend.memory.extractor import MemoryExtractor
 from backend.conversations.archive import ConversationArchive
 
+from backend.learning.contracts import LearningDomain
 from backend.learning.queue import LearningQueue
 from backend.learning.repository import LearningRepository
 from backend.learning.active import ActiveLearningEngine
@@ -115,7 +117,7 @@ private_learning_worker = PrivateLearningWorker(
 def background_learning_enabled() -> bool:
     value = os.getenv(
         "COGNITIVEAI_BACKGROUND_LEARNING_ENABLED",
-        "false",
+        "true",
     ).strip().lower()
 
     return value in {"1", "true", "yes", "on"}
@@ -221,6 +223,10 @@ app.add_middleware(
 
 planner = CognitivePlanner()
 evaluator = CognitiveEvaluator()
+
+semantic_evaluator = SemanticEvaluator(
+    deterministic_evaluator=evaluator
+)
 
 
 # ==========================================
@@ -636,7 +642,7 @@ async def supervisor_ask(request: AskRequest):
     user_id = memory_manager.owner
     conversation_id = request.conversation_id or str(uuid4())
 
-    # Archive the original user message before routing or model execution.
+    # 2. Archive the original user message.
 
     try:
         conversation_archive.save_message(
@@ -649,7 +655,11 @@ async def supervisor_ask(request: AskRequest):
         )
 
     except Exception as error:
-        record_failure(interaction_id, "archive_user_message", error)
+        record_failure(
+            interaction_id,
+            "archive_user_message",
+            error,
+        )
 
         raise HTTPException(
             status_code=503,
@@ -665,7 +675,7 @@ async def supervisor_ask(request: AskRequest):
         details={"privacy": privacy},
     )
 
-    # 2. Supervisor classification and planning.
+    # 3. Supervisor classification and planning.
 
     task_request = TaskRequest(
         task=request.question,
@@ -710,7 +720,7 @@ async def supervisor_ask(request: AskRequest):
             detail=str(error),
         )
 
-    # 3. Select the configured local model.
+    # 4. Select the configured local model.
 
     try:
         settings = get_settings()
@@ -728,7 +738,7 @@ async def supervisor_ask(request: AskRequest):
             detail="Model configuration failed.",
         )
 
-    # 4. Retrieve memories under the requested privacy boundary.
+    # 5. Retrieve memories under the requested privacy boundary.
 
     try:
         memories = memory_manager.recall(
@@ -769,7 +779,7 @@ async def supervisor_ask(request: AskRequest):
 
     memory_context = build_memory_context(memories)
 
-    # 5. Build the model prompt.
+    # 6. Build the original answer prompt.
 
     system_prompt = (
         "You are CognitiveAI, a thoughtful and transparent "
@@ -792,7 +802,7 @@ async def supervisor_ask(request: AskRequest):
         max_tokens=request.max_tokens,
     )
 
-    # 6. Create the provider.
+    # 7. Create the local provider.
 
     try:
         provider = create_provider(
@@ -825,7 +835,7 @@ async def supervisor_ask(request: AskRequest):
         },
     )
 
-    # 7. Execute locally.
+    # 8. Generate the initial answer locally.
 
     transparency_recorder.record(
         user_id=user_id,
@@ -881,7 +891,116 @@ async def supervisor_ask(request: AskRequest):
         },
     )
 
-    # 8. Archive the original assistant response.
+    # 9. Evaluate the initial answer.
+    #
+    # Evaluation uses the same local provider.
+    # If evaluation fails, retain the generated answer and report
+    # that evaluation was unavailable rather than inventing a result.
+
+    final_answer = model_response.content
+    evaluation_result = None
+    evaluation_status = "unavailable"
+    evaluation_decision = None
+    revision_attempts = 0
+    initial_outcome = None
+
+    try:
+        initial_outcome = await semantic_evaluator.evaluate_response(
+            question=request.question,
+            answer=final_answer,
+            provider=provider,
+        )
+
+        evaluation_result = initial_outcome.model_dump()
+        evaluation_status = "completed"
+        evaluation_decision = initial_outcome.evaluation.decision
+
+    except Exception as error:
+        record_failure(
+            interaction_id,
+            "semantic_evaluation",
+            error,
+        )
+
+    # 10. Revise once if the evaluator requests revision.
+
+    if (
+        evaluation_status == "completed"
+        and evaluation_decision == "revise"
+        and initial_outcome is not None
+    ):
+        assessment = initial_outcome.assessment
+
+        revision_prompt = (
+            "Improve the following draft answer using the evaluator's "
+            "feedback.\n\n"
+            f"User question:\n{request.question}\n\n"
+            f"Original draft:\n{final_answer}\n\n"
+            f"Evaluator feedback:\n{assessment.feedback}\n\n"
+            f"Unsupported claims to address:\n"
+            f"{assessment.unsupported_claims}\n\n"
+            f"Missing information to address:\n"
+            f"{assessment.missing_information}\n\n"
+            "Produce a better answer that directly addresses the user's "
+            "question. Correct unsupported claims, address important "
+            "omissions, and acknowledge uncertainty where appropriate. "
+            "Do not mention this internal evaluation process."
+        )
+
+        revision_request = ModelRequest(
+            prompt=revision_prompt,
+            system_prompt=system_prompt,
+            temperature=request.temperature,
+            max_tokens=request.max_tokens,
+        )
+
+        # Count the revision attempt even if the provider fails.
+
+        revision_attempts = 1
+
+        try:
+            revision_response = await provider.generate(
+                revision_request
+            )
+
+            if not revision_response.success:
+                raise RuntimeError(
+                    revision_response.error
+                    or "The local model could not revise the answer."
+                )
+
+            if not revision_response.content.strip():
+                raise RuntimeError(
+                    "The local model returned an empty revision."
+                )
+
+            # Evaluate the revised answer before adopting it.
+
+            revision_outcome = (
+                await semantic_evaluator.evaluate_response(
+                    question=request.question,
+                    answer=revision_response.content,
+                    provider=provider,
+                )
+            )
+
+            # Adopt the revision only after its evaluation succeeds.
+
+            final_answer = revision_response.content
+            evaluation_result = revision_outcome.model_dump()
+            evaluation_decision = revision_outcome.evaluation.decision
+
+        except Exception as error:
+            record_failure(
+                interaction_id,
+                "answer_revision",
+                error,
+            )
+
+            # Keep the original answer and original evaluation.
+            # Never attempt a second revision.
+
+    # 11. Archive only the final assistant answer.
 
     try:
         conversation_archive.save_message(
@@ -889,7 +1008,7 @@ async def supervisor_ask(request: AskRequest):
             conversation_id=conversation_id,
             interaction_id=interaction_id,
             role="assistant",
-            content=model_response.content,
+            content=final_answer,
             privacy=privacy,
         )
 
@@ -908,9 +1027,10 @@ async def supervisor_ask(request: AskRequest):
             ),
         )
 
-    # 9. Immediate memory extraction.
+    # 12. Immediate memory extraction.
     #
     # This existing feature remains separate from background learning.
+    # Only private interactions enter personal memory extraction.
 
     if privacy == "private":
         memory_result = await automatically_remember(
@@ -927,7 +1047,7 @@ async def supervisor_ask(request: AskRequest):
             "extraction_status": "skipped_public_request",
         }
 
-    # 10. Enqueue private conversation for background learning.
+    # 13. Enqueue private conversation for background learning.
     #
     # Public conversations are deliberately excluded.
 
@@ -940,7 +1060,7 @@ async def supervisor_ask(request: AskRequest):
             "discovered": 0,
         }
 
-    # 11. Record successful completion.
+    # 14. Record successful completion.
 
     transparency_recorder.record(
         user_id=user_id,
@@ -950,7 +1070,7 @@ async def supervisor_ask(request: AskRequest):
         status=EventStatus.COMPLETED,
     )
 
-    # 12. Return the answer and processing status.
+    # 15. Return the final answer and processing status.
 
     return {
         "supervisor": "CognitiveAI",
@@ -961,8 +1081,20 @@ async def supervisor_ask(request: AskRequest):
             f"/transparency/interactions/{interaction_id}"
         ),
         "question": request.question,
-        "answer": model_response.content,
+        "answer": final_answer,
         "privacy": privacy,
+        "evaluation": {
+            "status": evaluation_status,
+            "decision": evaluation_decision,
+            "result": evaluation_result,
+            "revision_attempts": revision_attempts,
+            "max_revision_attempts": 1,
+            "method": "local_llm_judge_plus_deterministic_rules",
+            "scope": (
+                "Heuristic answer-quality assessment; "
+                "not independent factual verification."
+            ),
+        },
         "routing": {
             "task_type": routing.task_type,
             "complexity": routing.complexity,

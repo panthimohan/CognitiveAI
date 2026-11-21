@@ -1,17 +1,26 @@
+
+# Environment and secrets
 .env
 .env.*
+!.env.example
+
+# Python
 __pycache__/
 *.py[cod]
 .venv/
 venv/
 cognitiveai/
-.DS_Store
-data/personal/
-
-# Python environments
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
+# Private data and local databases
+data/personal/
+data/*.sqlite3
+data/*.sqlite3-shm
+data/*.sqlite3-wal
+data/*.db
+*.zip
 
 # Frontend
 node_modules/
@@ -23,19 +32,5 @@ dist/
 .vscode/
 .idea/
 
-# Private databases and backups
-data/*.sqlite3
-data/*.db
-*.zip
-
-# Secrets
-.env
-.env.*
-!.env.example
-
-# Python and frontend
-__pycache__/
-*.pyc
-.pytest_cache/
-node_modules/
-.venv/
+# macOS
+.DS_Store

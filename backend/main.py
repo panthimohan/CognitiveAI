@@ -1,15 +1,17 @@
 
+import asyncio
+import logging
 import os
+from contextlib import asynccontextmanager
 from uuid import uuid4
+
+from backend.learning.contracts import LearningDomain
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from backend.supervisor.router import (
-    TaskRequest,
-    route_task,
-)
+from backend.supervisor.router import TaskRequest, route_task
 from backend.supervisor.planner import CognitivePlanner
 from backend.supervisor.evaluator import CognitiveEvaluator
 
@@ -21,6 +23,14 @@ from backend.memory.processor import MemoryProcessor
 from backend.memory.extractor import MemoryExtractor
 from backend.conversations.archive import ConversationArchive
 
+from backend.learning.queue import LearningQueue
+from backend.learning.repository import LearningRepository
+from backend.learning.active import ActiveLearningEngine
+from backend.learning.consolidation import LearningConsolidator
+from backend.learning.lifecycle import LearningLifecycle
+from backend.learning.claim_extractor import ClaimExtractor
+from backend.learning.background import PrivateLearningWorker
+
 from backend.transparency.events import EventStatus, EventType
 from backend.transparency.event_store import InMemoryEventStore
 from backend.transparency.recorder import TransparencyRecorder
@@ -29,10 +39,176 @@ from backend.transparency.audit import TransparencyAudit
 from config.settings import get_settings
 
 
+logger = logging.getLogger("cognitiveai")
+
+
+# ==========================================
+# MEMORY AND ARCHIVE SERVICES
+# ==========================================
+
+memory_manager = MemoryManager(
+    owner=os.getenv("COGNITIVEAI_OWNER", "local-user")
+)
+
+memory_processor = MemoryProcessor(memory_manager)
+
+conversation_archive = ConversationArchive()
+
+
+# ==========================================
+# LEARNING SERVICES
+# ==========================================
+
+# Learning storage is independent of the conversation archive
+# and the permanent-memory database.
+
+learning_queue = LearningQueue()
+learning_repository = LearningRepository()
+
+active_learning_engine = ActiveLearningEngine(
+    repository=learning_repository,
+)
+
+learning_consolidator = LearningConsolidator()
+
+learning_lifecycle = LearningLifecycle(
+    repository=learning_repository,
+    active_engine=active_learning_engine,
+    consolidator=learning_consolidator,
+)
+
+# Background extraction uses the configured general-purpose
+# local model. It does not use a cloud provider.
+
+settings = get_settings()
+
+background_model = settings.local_model_for("conversation")
+
+background_provider = create_provider(
+    name="local",
+    model=background_model,
+)
+
+background_memory_extractor = MemoryExtractor(
+    provider=background_provider,
+)
+
+background_claim_extractor = ClaimExtractor(
+    provider=background_provider,
+)
+
+private_learning_worker = PrivateLearningWorker(
+    archive=conversation_archive,
+    queue=learning_queue,
+    extractor=background_memory_extractor,
+    processor=memory_processor,
+    claim_extractor=background_claim_extractor,
+    active_engine=active_learning_engine,
+    lifecycle=learning_lifecycle,
+)
+
+
+# ==========================================
+# BACKGROUND WORKER CONFIGURATION
+# ==========================================
+
+def background_learning_enabled() -> bool:
+    value = os.getenv(
+        "COGNITIVEAI_BACKGROUND_LEARNING_ENABLED",
+        "false",
+    ).strip().lower()
+
+    return value in {"1", "true", "yes", "on"}
+
+
+async def background_learning_loop() -> None:
+    """
+    Continuously process durable private-learning jobs.
+
+    The queue owns retry and checkpoint behavior.
+    The loop only waits when there is no available work.
+    """
+
+    logger.info("Background learning worker started.")
+
+    while True:
+        try:
+            result = await private_learning_worker.process_next()
+
+            if result is None:
+                await asyncio.sleep(3)
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception:
+            logger.exception(
+                "Unexpected background learning worker error."
+            )
+
+            await asyncio.sleep(5)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Application lifecycle.
+
+    When enabled, recover archived conversations into the
+    durable queue and start the background processing loop.
+    """
+
+    worker_task = None
+
+    if background_learning_enabled():
+        try:
+            recovered = learning_queue.enqueue_archived_conversations(
+                conversation_archive,
+                owner=memory_manager.owner,
+            )
+
+            logger.info(
+                "Background learning startup recovery completed: %s",
+                recovered,
+            )
+
+        except Exception:
+            logger.exception(
+                "Could not recover archived conversations."
+            )
+
+        worker_task = asyncio.create_task(
+            background_learning_loop()
+        )
+
+    else:
+        logger.info(
+            "Background learning is disabled. "
+            "Set COGNITIVEAI_BACKGROUND_LEARNING_ENABLED=true to enable it."
+        )
+
+    yield
+
+    if worker_task is not None:
+        worker_task.cancel()
+
+        try:
+            await worker_task
+        except asyncio.CancelledError:
+            pass
+
+    logger.info("CognitiveAI application shutdown complete.")
+
+
+# ==========================================
+# APPLICATION
+# ==========================================
+
 app = FastAPI(
     title="CognitiveAI",
     description="Metacognitive Intelligence Platform",
     version="0.4.1",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -48,28 +224,8 @@ evaluator = CognitiveEvaluator()
 
 
 # ==========================================
-# MEMORY SERVICES
-# ==========================================
-
-# Single-user development configuration.
-# Production must derive identity from authenticated sessions.
-
-memory_manager = MemoryManager(
-    owner=os.getenv("COGNITIVEAI_OWNER", "local-user")
-)
-
-memory_processor = MemoryProcessor(memory_manager)
-
-# Persistent conversation history is independent of memory extraction.
-conversation_archive = ConversationArchive()
-
-
-# ==========================================
 # TRANSPARENCY SERVICES
 # ==========================================
-
-# Development only:
-# Events disappear when the process restarts.
 
 transparency_store = InMemoryEventStore()
 transparency_recorder = TransparencyRecorder(transparency_store)
@@ -123,7 +279,7 @@ def record_failure(
 
 
 # ==========================================
-# APPLICATION
+# APPLICATION ENDPOINTS
 # ==========================================
 
 @app.get("/")
@@ -138,6 +294,40 @@ async def home():
 @app.get("/health")
 async def health():
     return {"status": "healthy"}
+
+
+@app.get("/learning/status")
+async def learning_status():
+    """
+    Report the configuration and persistent learning statistics.
+
+    This endpoint does not expose private conversation contents.
+    """
+
+    try:
+        statistics = learning_repository.get_statistics(
+            domain=LearningDomain.PRIVATE,
+            owner=memory_manager.owner,
+        )
+
+        return {
+            "background_learning_enabled": background_learning_enabled(),
+            "worker": (
+                "enabled"
+                if background_learning_enabled()
+                else "disabled"
+            ),
+            "owner_scope": "private",
+            "repository": statistics,
+        }
+
+    except Exception as error:
+        logger.exception("Could not retrieve learning status.")
+
+        raise HTTPException(
+            status_code=500,
+            detail="Could not retrieve learning status.",
+        ) from error
 
 
 # ==========================================
@@ -282,7 +472,7 @@ async def get_archived_conversation(
 
 
 # ==========================================
-# AUTOMATIC MEMORY EXTRACTION
+# IMMEDIATE MEMORY EXTRACTION
 # ==========================================
 
 async def automatically_remember(
@@ -347,8 +537,6 @@ async def automatically_remember(
                     saved_count += 1
 
             except Exception:
-                # An individual memory failure must not
-                # interrupt the remaining candidates.
                 continue
 
         result["memories_saved"] = saved_count
@@ -386,6 +574,48 @@ async def automatically_remember(
 
 
 # ==========================================
+# BACKGROUND QUEUE ENQUEUE
+# ==========================================
+
+def enqueue_private_learning(
+    user_id: str,
+) -> dict:
+    """
+    Discover archived private conversations and enqueue work.
+
+    Queue failures do not invalidate a completed user response.
+    The queue performs duplicate and checkpoint checks.
+    """
+
+    if user_id != memory_manager.owner:
+        return {
+            "status": "skipped",
+            "reason": "owner_scope_mismatch",
+        }
+
+    try:
+        queued = learning_queue.enqueue_archived_conversations(
+            conversation_archive,
+            owner=user_id,
+        )
+
+        return {
+            "status": "queued",
+            "discovered": queued,
+        }
+
+    except Exception as error:
+        logger.exception(
+            "Could not enqueue private conversation for learning."
+        )
+
+        return {
+            "status": "queue_error",
+            "error_type": type(error).__name__,
+        }
+
+
+# ==========================================
 # REAL QUESTION-ANSWER PIPELINE
 # ==========================================
 
@@ -407,7 +637,6 @@ async def supervisor_ask(request: AskRequest):
     conversation_id = request.conversation_id or str(uuid4())
 
     # Archive the original user message before routing or model execution.
-    # If durable storage is unavailable, stop rather than silently lose it.
 
     try:
         conversation_archive.save_message(
@@ -418,6 +647,7 @@ async def supervisor_ask(request: AskRequest):
             content=request.question,
             privacy=privacy,
         )
+
     except Exception as error:
         record_failure(interaction_id, "archive_user_message", error)
 
@@ -432,9 +662,7 @@ async def supervisor_ask(request: AskRequest):
         event_type=EventType.INTERACTION_STARTED,
         source="supervisor_ask",
         status=EventStatus.STARTED,
-        details={
-            "privacy": privacy,
-        },
+        details={"privacy": privacy},
     )
 
     # 2. Supervisor classification and planning.
@@ -641,8 +869,6 @@ async def supervisor_ask(request: AskRequest):
             ),
         )
 
-    # Record completed model execution.
-
     transparency_recorder.record(
         user_id=user_id,
         interaction_id=interaction_id,
@@ -655,7 +881,7 @@ async def supervisor_ask(request: AskRequest):
         },
     )
 
-    # 8. Archive the original assistant response independently of learning.
+    # 8. Archive the original assistant response.
 
     try:
         conversation_archive.save_message(
@@ -682,10 +908,9 @@ async def supervisor_ask(request: AskRequest):
             ),
         )
 
-    # 9. Automatic memory extraction.
+    # 9. Immediate memory extraction.
     #
-    # Only private requests are automatically remembered.
-    # Public requests are never automatically stored.
+    # This existing feature remains separate from background learning.
 
     if privacy == "private":
         memory_result = await automatically_remember(
@@ -702,7 +927,20 @@ async def supervisor_ask(request: AskRequest):
             "extraction_status": "skipped_public_request",
         }
 
-    # 10. Record successful completion.
+    # 10. Enqueue private conversation for background learning.
+    #
+    # Public conversations are deliberately excluded.
+
+    if privacy == "private":
+        background_result = enqueue_private_learning(user_id)
+
+    else:
+        background_result = {
+            "status": "skipped_public_request",
+            "discovered": 0,
+        }
+
+    # 11. Record successful completion.
 
     transparency_recorder.record(
         user_id=user_id,
@@ -712,7 +950,7 @@ async def supervisor_ask(request: AskRequest):
         status=EventStatus.COMPLETED,
     )
 
-    # 11. Return the answer and transparency reference.
+    # 12. Return the answer and processing status.
 
     return {
         "supervisor": "CognitiveAI",
@@ -747,6 +985,7 @@ async def supervisor_ask(request: AskRequest):
             "candidates_found": memory_result["candidates_found"],
             "extraction_status": memory_result["extraction_status"],
         },
+        "background_learning": background_result,
         "plan": plan.model_dump(),
         "execution_status": "completed",
     }

@@ -1,31 +1,23 @@
+
 """
 CognitiveAI - Memory Manager
 
-Connects foreground and background memory for one user, across
-two scopes:
+Connects foreground and background memory for one user.
 
-    PERSONAL  foreground + background, belongs to the user
-    PUBLIC    foreground + background, shared knowledge
+PERSONAL:
+    Private memories belonging to this owner.
 
-Flow:
-    remember()    -> new item enters FOREGROUND
-                     (items pushed out by capacity go to BACKGROUND,
-                      so nothing is silently lost)
-    recall()      -> searches foreground, then BACKGROUND; background
-                     hits are pulled into the foreground
-    consolidate() -> forgets faded memories, then saves important or
-                     frequently used foreground items to BACKGROUND
-    share()       -> explicitly copies a personal memory to public
-    forget()      -> deletes a personal memory everywhere
+PUBLIC:
+    Shared memories available to public tasks.
 
-Privacy rules (what a task may SEE):
-    privacy="public"  -> public memory only. A public task may be
-                         sent to an external AI provider, so personal
-                         memories must never be included.
-    privacy="private" -> personal + public memory. Private tasks run
-                         locally, so nothing leaves the machine.
+Recall behavior:
+    1. Search foreground memories by keyword relevance.
+    2. Search background memories by keyword relevance.
+    3. For broad personal-profile questions, fall back to the
+       strongest personal memories.
+    4. Preserve strict privacy boundaries.
 
-Personal memory only reaches public memory through share().
+Personal memories enter public memory only through share().
 """
 
 from pathlib import Path
@@ -55,6 +47,11 @@ class ConsolidationReport(BaseModel):
 
 class MemoryManager:
 
+    PROFILE_QUERY_TERMS = {
+        "about", "know", "remember", "profile",
+        "myself", "me", "personal", "who"
+    }
+
     def __init__(
         self,
         owner: str,
@@ -67,20 +64,31 @@ class MemoryManager:
         self.owner = owner
 
         self.personal_fg = ForegroundMemory(
-            MemoryScope.PERSONAL, owner=owner,
-            capacity=foreground_capacity, clock=clock
+            MemoryScope.PERSONAL,
+            owner=owner,
+            capacity=foreground_capacity,
+            clock=clock
         )
+
         self.personal_bg = BackgroundMemory(
-            MemoryScope.PERSONAL, owner=owner, base_dir=base_dir,
-            half_life_days=half_life_days, clock=clock
+            MemoryScope.PERSONAL,
+            owner=owner,
+            base_dir=base_dir,
+            half_life_days=half_life_days,
+            clock=clock
         )
+
         self.public_fg = ForegroundMemory(
             MemoryScope.PUBLIC,
-            capacity=foreground_capacity, clock=clock
+            capacity=foreground_capacity,
+            clock=clock
         )
+
         self.public_bg = BackgroundMemory(
-            MemoryScope.PUBLIC, base_dir=base_dir,
-            half_life_days=half_life_days, clock=clock
+            MemoryScope.PUBLIC,
+            base_dir=base_dir,
+            half_life_days=half_life_days,
+            clock=clock
         )
 
     # --------------------------------------
@@ -94,8 +102,11 @@ class MemoryManager:
 
         return self.public_fg, self.public_bg
 
-    def _add_to_foreground(self, scope, item: MemoryItem) -> None:
-        """Add to foreground; anything evicted moves to background."""
+    def _add_to_foreground(
+        self,
+        scope,
+        item: MemoryItem
+    ) -> None:
 
         fg, bg = self._stores(scope)
         evicted = fg.add(item)
@@ -104,7 +115,11 @@ class MemoryManager:
             bg.add_many(evicted)
 
     @staticmethod
-    def _foreground_matches(fg, query, kind) -> list[MemoryItem]:
+    def _foreground_matches(
+        fg,
+        query,
+        kind
+    ) -> list[MemoryItem]:
 
         words = tokenize(query)
         query_words = (words - STOPWORDS) or words
@@ -116,15 +131,92 @@ class MemoryManager:
             if kind is not None and item.kind != kind:
                 continue
 
-            overlap = len(query_words & tokenize(item.content))
+            overlap = len(
+                query_words & tokenize(item.content)
+            )
 
             if overlap:
                 matches.append((overlap, item))
 
-        # fg.items() is already ordered by salience; sort is stable
-        matches.sort(key=lambda pair: pair[0], reverse=True)
+        matches.sort(
+            key=lambda pair: pair[0],
+            reverse=True
+        )
 
         return [item for _, item in matches]
+
+    @staticmethod
+    def _is_profile_query(query: str) -> bool:
+        """
+        Detect broad questions asking what the system knows
+        or remembers about the current user.
+        """
+
+        words = tokenize(query)
+
+        return bool(
+            words & MemoryManager.PROFILE_QUERY_TERMS
+        )
+
+    @staticmethod
+    def _unique(
+        items: list[MemoryItem]
+    ) -> list[MemoryItem]:
+
+        result = []
+        seen = set()
+
+        for item in items:
+            if item.id not in seen:
+                seen.add(item.id)
+                result.append(item)
+
+        return result
+
+    def _strongest_personal_memories(
+        self,
+        limit: int,
+        kind: MemoryKind | None = None
+    ) -> list[MemoryItem]:
+        """
+        Return the strongest personal memories regardless of
+        keyword overlap. Used only for private profile queries.
+        """
+
+        foreground = [
+            item
+            for item in self.personal_fg.items()
+            if kind is None or item.kind == kind
+        ]
+
+        background = [
+            item
+            for item in self.personal_bg.all()
+            if kind is None or item.kind == kind
+        ]
+
+        combined = self._unique(
+            foreground + background
+        )
+
+        # Foreground order represents salience; background order
+        # represents calculated memory strength.
+        foreground_ids = {
+            item.id: index
+            for index, item in enumerate(foreground)
+        }
+
+        combined.sort(
+            key=lambda item: (
+                item.id in foreground_ids,
+                -foreground_ids.get(item.id, 0)
+                if item.id in foreground_ids
+                else 0
+            ),
+            reverse=True
+        )
+
+        return combined[:limit]
 
     # --------------------------------------
     # Remember
@@ -141,7 +233,11 @@ class MemoryManager:
         item = MemoryItem(
             content=content,
             scope=scope,
-            owner=self.owner if scope == MemoryScope.PERSONAL else None,
+            owner=(
+                self.owner
+                if scope == MemoryScope.PERSONAL
+                else None
+            ),
             kind=kind,
             importance=importance
         )
@@ -163,35 +259,48 @@ class MemoryManager:
     ) -> list[MemoryItem]:
 
         if privacy not in {"private", "public"}:
-            raise ValueError("Privacy must be private or public")
+            raise ValueError(
+                "Privacy must be private or public"
+            )
+
+        if limit <= 0:
+            return []
 
         if privacy == "public":
             scopes = [MemoryScope.PUBLIC]
         else:
-            scopes = [MemoryScope.PERSONAL, MemoryScope.PUBLIC]
+            scopes = [
+                MemoryScope.PERSONAL,
+                MemoryScope.PUBLIC
+            ]
 
         results: list[MemoryItem] = []
         seen: set[str] = set()
 
+        # 1. Normal keyword-based retrieval.
         for scope in scopes:
 
             fg, bg = self._stores(scope)
 
-            # 1. Foreground first (what we're already focused on)
-            for item in self._foreground_matches(fg, query, kind):
+            for item in self._foreground_matches(
+                fg, query, kind
+            ):
 
                 if len(results) >= limit:
                     break
 
                 if item.id not in seen:
                     seen.add(item.id)
-                    fg.get(item.id)          # counts as access
+                    fg.get(item.id)
                     results.append(item)
 
-            # 2. Then background; pull hits into the foreground
             if len(results) < limit:
 
-                for item in bg.search(query, limit=limit, kind=kind):
+                for item in bg.search(
+                    query,
+                    limit=limit,
+                    kind=kind
+                ):
 
                     if len(results) >= limit:
                         break
@@ -202,10 +311,44 @@ class MemoryManager:
                     seen.add(item.id)
 
                     focused = item.model_copy()
-                    self._add_to_foreground(scope, focused)
+
+                    self._add_to_foreground(
+                        scope,
+                        focused
+                    )
+
                     results.append(focused)
 
-        return results
+        # 2. Profile fallback.
+        # Never run this for public requests.
+        if (
+            privacy == "private"
+            and len(results) < limit
+            and self._is_profile_query(query)
+        ):
+
+            personal = self._strongest_personal_memories(
+                limit=limit - len(results),
+                kind=kind
+            )
+
+            for item in personal:
+
+                if item.id in seen:
+                    continue
+
+                seen.add(item.id)
+
+                # Count this retrieval as an access.
+                if self.personal_fg.get(item.id) is None:
+                    self.personal_bg.get(item.id)
+
+                results.append(item)
+
+                if len(results) >= limit:
+                    break
+
+        return results[:limit]
 
     # --------------------------------------
     # Consolidate
@@ -219,11 +362,16 @@ class MemoryManager:
         promoted = 0
         forgotten = 0
 
-        for scope in (MemoryScope.PERSONAL, MemoryScope.PUBLIC):
+        for scope in (
+            MemoryScope.PERSONAL,
+            MemoryScope.PUBLIC
+        ):
 
             fg, bg = self._stores(scope)
 
-            forgotten += len(bg.forget_weak(forget_threshold))
+            forgotten += len(
+                bg.forget_weak(forget_threshold)
+            )
 
             candidates = [
                 item.model_copy()
@@ -239,10 +387,13 @@ class MemoryManager:
         )
 
     # --------------------------------------
-    # Share and forget (personal memory only)
+    # Share and forget
     # --------------------------------------
 
-    def _find_personal(self, item_id: str) -> MemoryItem | None:
+    def _find_personal(
+        self,
+        item_id: str
+    ) -> MemoryItem | None:
 
         for item in self.personal_fg.items():
             if item.id == item_id:
@@ -255,15 +406,14 @@ class MemoryManager:
         return None
 
     def share(self, item_id: str) -> MemoryItem:
-        """
-        Explicitly copy a personal memory into public memory.
-        The copy is a new item with no owner; the original stays.
-        """
+        """Explicitly copy personal memory into public memory."""
 
         original = self._find_personal(item_id)
 
         if original is None:
-            raise KeyError(f"No personal memory with id {item_id}")
+            raise KeyError(
+                f"No personal memory with id {item_id}"
+            )
 
         return self.remember(
             content=original.content,
@@ -273,9 +423,12 @@ class MemoryManager:
         )
 
     def forget(self, item_id: str) -> bool:
-        """Delete a personal memory from foreground and background."""
+        """Delete personal memory from foreground and background."""
 
         removed_fg = self.personal_fg.remove(item_id)
         removed_bg = self.personal_bg.remove(item_id)
 
-        return removed_fg is not None or removed_bg is not None
+        return (
+            removed_fg is not None
+            or removed_bg is not None
+        )

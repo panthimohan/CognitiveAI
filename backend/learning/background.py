@@ -2,17 +2,21 @@
 """
 CognitiveAI - Private Background Learning Worker
 
-Processes archived private conversations using the asynchronous
-AI provider interface.
+Processes archived private conversations through two independent
+learning paths:
+
+1. Memory extraction and persistence.
+2. Structured claim extraction and active learning.
 
 Responsibilities:
 - Claim durable learning jobs.
 - Read conversation history in chronological pages.
 - Split large messages without truncating their contents.
-- Extract useful personal memories asynchronously.
-- Persist memories through MemoryProcessor.
-- Advance checkpoints only after successful processing.
-- Retry failed jobs through LearningQueue.
+- Extract and persist personal memories.
+- Extract and record structured private claims.
+- Run the persistent insight lifecycle after processing.
+- Advance checkpoints only after successful batch processing.
+- Retry failed jobs safely.
 
 Private conversations are never sent to public learning.
 """
@@ -21,6 +25,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from backend.conversations.archive import ConversationArchive
+from backend.learning.active import ActiveLearningEngine
+from backend.learning.claim_extractor import ClaimExtractor
+from backend.learning.contracts import LearningDomain
+from backend.learning.lifecycle import LearningLifecycle
 from backend.learning.queue import LearningJob, LearningQueue
 from backend.memory.extractor import MemoryExtractor
 from backend.memory.processor import MemoryProcessor
@@ -36,11 +44,20 @@ class LearningRunResult:
     memories_duplicate: int = 0
     memories_skipped: int = 0
     memories_rejected: int = 0
+
+    claims_extracted: int = 0
+    claims_recorded: int = 0
+    claims_duplicate: int = 0
+    insights_created: int = 0
+
     error: str | None = None
 
 
 class PrivateLearningWorker:
-    """Processes private archived conversations into personal memory."""
+    """
+    Processes private archived conversations into memory and
+    structured learning evidence.
+    """
 
     def __init__(
         self,
@@ -49,6 +66,9 @@ class PrivateLearningWorker:
         queue: LearningQueue,
         extractor: MemoryExtractor,
         processor: MemoryProcessor,
+        claim_extractor: ClaimExtractor | None = None,
+        active_engine: ActiveLearningEngine | None = None,
+        lifecycle: LearningLifecycle | None = None,
         page_size: int = 100,
         lease_seconds: int = 300,
         max_attempts: int = 5,
@@ -67,6 +87,28 @@ class PrivateLearningWorker:
         if retry_delay_seconds < 0:
             raise ValueError("Retry delay cannot be negative.")
 
+        learning_components = (
+            claim_extractor,
+            active_engine,
+            lifecycle,
+        )
+
+        if any(item is not None for item in learning_components):
+            if not all(item is not None for item in learning_components):
+                raise ValueError(
+                    "Claim learning requires claim_extractor, "
+                    "active_engine, and lifecycle together."
+                )
+
+        if (
+            lifecycle is not None
+            and lifecycle.active_engine is not active_engine
+        ):
+            raise ValueError(
+                "The lifecycle and worker must use the same "
+                "ActiveLearningEngine instance."
+            )
+
         extractor_limit = getattr(
             extractor,
             "max_input_characters",
@@ -84,6 +126,11 @@ class PrivateLearningWorker:
         self.queue = queue
         self.extractor = extractor
         self.processor = processor
+
+        self.claim_extractor = claim_extractor
+        self.active_engine = active_engine
+        self.lifecycle = lifecycle
+
         self.page_size = page_size
         self.lease_seconds = lease_seconds
         self.max_attempts = max_attempts
@@ -159,8 +206,20 @@ class PrivateLearningWorker:
                     result,
                 )
 
-                # Every message in this page has been checkpointed.
+                # Each successful batch advances the persistent queue.
                 job.checkpoint_offset += len(messages)
+
+            # Run insight discovery after all available conversation
+            # evidence has been recorded. If this fails, the job retries.
+            if self.lifecycle is not None:
+                learning_result = self.lifecycle.run(
+                    domain=LearningDomain.PRIVATE,
+                    owner=job.owner,
+                )
+
+                result.insights_created += (
+                    learning_result.insights_created
+                )
 
             self.queue.complete(job_id=job.id)
 
@@ -183,9 +242,13 @@ class PrivateLearningWorker:
         self,
         text: str,
         result: LearningRunResult,
+        *,
+        owner: str,
+        source_ref: str,
     ) -> None:
-        """Extract candidates asynchronously and store them."""
+        """Run memory extraction and optional structured claim learning."""
 
+        # Existing memory pipeline.
         candidates = await self.extractor.extract(text)
 
         processed = self.processor.process_many(candidates)
@@ -205,6 +268,26 @@ class PrivateLearningWorker:
             elif item.status == "rejected":
                 result.memories_rejected += 1
 
+        # Structured claim pipeline.
+        if self.claim_extractor is None:
+            return
+
+        observations = await self.claim_extractor.extract(
+            text,
+            owner=owner,
+            source_ref=source_ref,
+        )
+
+        result.claims_extracted += len(observations)
+
+        for observation in observations:
+            recorded = self.active_engine.record_claim(observation)
+
+            if recorded:
+                result.claims_recorded += 1
+            else:
+                result.claims_duplicate += 1
+
     async def _process_page(
         self,
         messages: list[Any],
@@ -215,21 +298,30 @@ class PrivateLearningWorker:
 
         pending: list[str] = []
         pending_characters = 0
+        pending_start_offset = job.checkpoint_offset + 1
         pending_end_offset = job.checkpoint_offset
         pending_message_count = 0
 
         async def flush_pending() -> None:
             nonlocal pending
             nonlocal pending_characters
+            nonlocal pending_start_offset
             nonlocal pending_end_offset
             nonlocal pending_message_count
 
             if not pending:
                 return
 
+            source_ref = (
+                f"conversation:{job.conversation_id}:"
+                f"messages:{pending_start_offset}-{pending_end_offset}"
+            )
+
             await self._extract_and_store(
                 "\n\n".join(pending),
                 result,
+                owner=job.owner,
+                source_ref=source_ref,
             )
 
             self.queue.update_checkpoint(
@@ -273,7 +365,8 @@ class PrivateLearningWorker:
                     for start in range(0, len(content), available)
                 ]
 
-                # Do not checkpoint this message until every part succeeds.
+                # Each part has a stable source reference. The experience
+                # ID also includes the claim key and value.
                 for number, part in enumerate(parts, start=1):
                     part_text = (
                         prefix
@@ -281,9 +374,16 @@ class PrivateLearningWorker:
                         + part
                     )
 
+                    source_ref = (
+                        f"conversation:{job.conversation_id}:"
+                        f"message:{message_offset}"
+                    )
+
                     await self._extract_and_store(
                         part_text,
                         result,
+                        owner=job.owner,
+                        source_ref=source_ref,
                     )
 
                 self.queue.update_checkpoint(
@@ -302,6 +402,9 @@ class PrivateLearningWorker:
                 > self.max_batch_characters
             ):
                 await flush_pending()
+
+            if not pending:
+                pending_start_offset = message_offset
 
             pending.append(rendered)
             pending_characters += len(rendered) + 2

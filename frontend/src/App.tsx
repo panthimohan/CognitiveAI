@@ -15,6 +15,8 @@ const navigation: { name: Section; icon: string }[] = [
 type AskResponse = {
   supervisor: string
   interaction_id: string
+  conversation_id: string
+  archive_status: string
   transparency_url: string
   question: string
   answer: string
@@ -32,17 +34,25 @@ type AskResponse = {
     memories_retrieved: number
     memory_ids: string[]
     memory_scopes: string[]
+    memories_saved: number
+    candidates_found: number
+    extraction_status: string
+  }
+  background_learning: {
+    status?: string
+    discovered?: number
+    [key: string]: unknown
   }
   execution_status: string
   detail?: string
 }
 
-const API_BASE_URL =
-  import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
+const API_BASE_URL = '/api'
 
 function App() {
   const [activeSection, setActiveSection] = useState<Section>('Workspace')
   const [question, setQuestion] = useState('')
+  const [conversationId, setConversationId] = useState<string | null>(null)
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [answerData, setAnswerData] = useState<AskResponse | null>(null)
   const [errorMessage, setErrorMessage] = useState('')
@@ -64,6 +74,7 @@ function App() {
         },
         body: JSON.stringify({
           question: trimmedQuestion,
+          conversation_id: conversationId,
           privacy: 'private',
           temperature: 0.7,
           max_tokens: 2000,
@@ -77,7 +88,7 @@ function App() {
       }
 
       setAnswerData(data)
-            setAnswerData(data)
+      setConversationId(data.conversation_id)
     } catch (error) {
       setErrorMessage(
         error instanceof Error
@@ -227,8 +238,18 @@ function App() {
               </div>
 
               <div>
+                <strong>Memories saved</strong>
+                <span>{answerData.memory.memories_saved}</span>
+              </div>
+
+              <div>
                 <strong>Execution</strong>
                 <span>{answerData.execution_status}</span>
+              </div>
+
+              <div>
+                <strong>Archive</strong>
+                <span>{answerData.archive_status}</span>
               </div>
             </div>
 

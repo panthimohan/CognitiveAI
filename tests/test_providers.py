@@ -220,9 +220,9 @@ def test_default_local_model_per_task_type():
 
     assert settings.local_model_for("coding") == "qwen2.5-coder:7b"
     assert settings.local_model_for("reasoning") == "deepseek-r1:7b"
-    assert settings.local_model_for("conversation") == "llama3.2"
-    assert settings.local_model_for("research") == "llama3.2"
-    assert settings.local_model_for("anything-else") == "llama3.2"
+    assert settings.local_model_for("conversation") == "qwen3:8b"
+    assert settings.local_model_for("research") == "qwen3:8b"
+    assert settings.local_model_for("anything-else") == "qwen3:8b"
 
 
 def test_settings_can_be_overridden_by_environment(monkeypatch):

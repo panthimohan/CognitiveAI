@@ -401,6 +401,34 @@ def build_memory_context(memories) -> str:
     return "\n".join(sections)
 
 
+def build_conversation_context(
+    messages,
+    *,
+    current_interaction_id: str,
+    max_messages: int = 30,
+    max_characters: int = 30000,
+) -> str:
+    """Format earlier archived turns, excluding the current request."""
+    previous = [
+        message for message in messages
+        if message.interaction_id != current_interaction_id
+        and message.role in {"user", "assistant"}
+        and message.content.strip()
+    ][-max_messages:]
+
+    lines = []
+    total = 0
+    for message in previous:
+        role = "User" if message.role == "user" else "CognitiveAI"
+        line = f"{role}: {message.content.strip()}"
+        if total + len(line) > max_characters:
+            break
+        lines.append(line)
+        total += len(line)
+
+    return "\n".join(lines) if lines else "This is the beginning of the conversation."
+
+
 # ==========================================
 # TRANSPARENCY API
 # ==========================================
@@ -790,9 +818,30 @@ async def supervisor_ask(request: AskRequest):
         "Do not claim to have performed actions you did not perform."
     )
 
+    # Retrieve prior turns from this conversation and privacy scope.
+    # The current user message is already archived, so exclude this interaction.
+    try:
+        archived_messages = conversation_archive.get_conversation(
+            owner=user_id,
+            conversation_id=conversation_id,
+            privacy=privacy,
+            limit=1000,
+        )
+        conversation_context = build_conversation_context(
+            archived_messages,
+            current_interaction_id=interaction_id,
+        )
+    except Exception as error:
+        record_failure(interaction_id, "conversation_history_retrieval", error)
+        raise HTTPException(
+            status_code=500,
+            detail="Conversation history retrieval failed.",
+        )
+
     prompt = (
         f"Relevant memory:\n{memory_context}\n\n"
-        f"User question:\n{request.question}"
+        f"Conversation so far (oldest first):\n{conversation_context}\n\n"
+        f"Current user question:\n{request.question}"
     )
 
     model_request = ModelRequest(

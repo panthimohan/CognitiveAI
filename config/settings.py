@@ -20,7 +20,7 @@ load_dotenv()
 
 
 DEFAULT_LOCAL_MODELS = {
-    "general": "llama3.2",
+    "general": "qwen3:8b",
     "coding": "qwen2.5-coder:7b",
     "reasoning": "qwen3:8b",
     "embedding": "nomic-embed-text",
